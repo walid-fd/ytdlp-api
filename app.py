@@ -1,88 +1,117 @@
-from flask import Flask, request, jsonify
-import yt_dlp
+from flask import Flask, request, send_file
 import os
+import time
+import yt_dlp
+import re
+import subprocess
+import threading
 
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return jsonify({"status": "ok", "message": "ytdlp-api running"})
-
-@app.route('/audio')
-def audio():
-    url = request.args.get('url')
+def convert_to_mobile_url(url):
     if not url:
-        return jsonify({"error": "url required"}), 400
-    try:
+        return url
+    video_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
+    if video_id_match:
+        video_id = video_id_match.group(1)
+        return f"https://m.youtube.com/watch?v={video_id}"
+    return url
+
+@app.route('/download', methods=['GET'])
+def download_file():
+    raw_url = request.args.get('url')
+    file_type = request.args.get('type', 'video')
+
+    if not raw_url:
+        return "URL is missing", 400
+
+    video_url = convert_to_mobile_url(raw_url)
+    timestamp = int(time.time())
+    cookie_file = "cookies.txt" if os.path.exists("cookies.txt") else None
+
+    if file_type == 'audio':
+        file_name = f"audio_{timestamp}.mp3"
         ydl_opts = {
             'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '5',
+            }],
+            'outtmpl': f"audio_{timestamp}.%(ext)s",
             'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
+            'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            formats = [f for f in info.get('formats', []) if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('url')]
-            formats.sort(key=lambda x: x.get('abr', 0) or 0, reverse=True)
-            best = formats[0] if formats else None
-            return jsonify({
-                "status": "ok",
-                "title": info.get('title'),
-                "duration": info.get('duration'),
-                "url": best['url'] if best else None
-            })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/video')
-def video():
-    url = request.args.get('url')
-    if not url:
-        return jsonify({"error": "url required"}), 400
-    try:
+        mimetype = 'audio/mpeg'
+    else:
+        file_name = f"video_{timestamp}.mp4"
         ydl_opts = {
-            'format': 'bestvideo[height<=480][ext=mp4]+bestaudio/best[height<=480]',
+            'format': '22/18/b[height<=480]',
+            'outtmpl': file_name,
             'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
+            'extractor_args': {'youtube': {'player_client': ['android,web']}}
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            formats = [f for f in info.get('formats', []) if f.get('vcodec') != 'none' and f.get('acodec') != 'none' and f.get('url') and (f.get('height') or 999) <= 480]
-            formats.sort(key=lambda x: x.get('height', 0) or 0, reverse=True)
-            best = formats[0] if formats else None
-            return jsonify({
-                "status": "ok",
-                "title": info.get('title'),
-                "duration": info.get('duration'),
-                "url": best['url'] if best else None,
-                "quality": f"{best.get('height', '?')}p" if best else None
-            })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        mimetype = 'video/mp4'
 
-@app.route('/search')
-def search():
-    query = request.args.get('q')
-    if not query:
-        return jsonify({"error": "q required"}), 400
+    if cookie_file:
+        ydl_opts['cookiefile'] = cookie_file
+
     try:
-        ydl_opts = { 'quiet': True, 'no_warnings': True, 'skip_download': True }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-            entry = info['entries'][0] if info.get('entries') else None
-            if not entry:
-                return jsonify({"error": "no results"}), 404
-            return jsonify({
-                "status": "ok",
-                "id": entry.get('id'),
-                "title": entry.get('title'),
-                "duration": entry.get('duration'),
-                "url": f"https://youtu.be/{entry.get('id')}"
-            })
+            ydl.download([video_url])
+
+        actual_file = file_name
+        if file_type == 'audio':
+            actual_file = f"audio_{timestamp}.mp3"
+            if not os.path.exists(actual_file):
+                for f in os.listdir('.'):
+                    if f.startswith(f"audio_{timestamp}") and f.endswith('.mp3'):
+                        actual_file = f
+                        break
+
+        if not os.path.exists(actual_file):
+            return "Download failed: File not found", 500
+
+        return send_file(actual_file, as_attachment=True, mimetype=mimetype)
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[ERROR]: {e}")
+        return str(e), 500
+        
+    finally:
+        time.sleep(2)
+        for f in [file_name, f"audio_{timestamp}.mp3", f"video_{timestamp}.mp4"]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
+def start_tunnel():
+    time.sleep(3)
+    try:
+        cmd = ["ssh", "-p", "443", "-o", "StrictHostKeyChecking=no", "-R0:localhost:5000", "a.pinggy.io"]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        
+        print("\n==================================================")
+        print("🚀 تم تفعيل نفق Pinggy بنجاح!")
+        print("==================================================")
+
+        for line in process.stdout:
+            if "run.pinggy-free.link" in line or "free.pinggy.net" in line:
+                parts = line.strip().split()
+                for part in parts:
+                    if part.startswith("https://"):
+                        print(f"\n🔗 الرابط المباشر للاتصال: \n👉 {part}\n")
+                        break
+            
+    except Exception as e:
+        print(f"[TUNNEL ERROR]: {e}")
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    tunnel_thread = threading.Thread(target=start_tunnel)
+    tunnel_thread.daemon = True
+    tunnel_thread.start()
+
+    print("🌐 جاري تشغيل سيرفر Flask المحلي...")
+    app.run(host='0.0.0.0', port=5000)
